@@ -16,6 +16,7 @@ contract StakingContract is ReentrancyGuard {
     event RoundThresholdAdjusted(uint256 indexed roundId, uint256 newThreshold);
     event RoundMultiplierAdjusted(uint256 indexed roundId, uint256 newMultiplier);
 
+    // Updated Round struct with maxStakePerPlayer
     struct Round {
         uint256 maxPlayerCount;
         uint256 threshold;
@@ -23,6 +24,7 @@ contract StakingContract is ReentrancyGuard {
         uint256 expiryBlockNumber;
         uint256 totalStaked;
         bool isResolved;
+        uint256 maxStakePerPlayer; // NEW: Maximum stake allowed per player in this round
         mapping(address => uint256) playerStakes;
         address[] players;
     }
@@ -95,16 +97,20 @@ contract StakingContract is ReentrancyGuard {
         emit Unstaked(msg.sender, amount);
     }
 
+    // Updated initializeRound to include maxStakePerPlayer
     function initializeRound(
         uint256 maxPlayerCount,
         uint256 threshold,
         uint256 multiplier,
-        uint256 expiryBlock
+        uint256 expiryBlock,
+        uint256 maxStakePerPlayer // NEW parameter: maximum tokens a player can stake in this round
     ) external onlyHostAgent {
         require(expiryBlock > block.number, "Invalid expiry block");
         require(multiplier >= 100, "Invalid multiplier");
         require(maxPlayerCount > 0, "Invalid player count");
         require(threshold > 0, "Invalid threshold");
+        // Ensure the threshold is achievable: maxPlayerCount * maxStakePerPlayer must be at least the threshold.
+        require(maxPlayerCount * maxStakePerPlayer >= threshold, "Threshold too high for given player cap and per-player cap");
 
         currentRoundId++;
         Round storage newRound = rounds[currentRoundId];
@@ -112,60 +118,22 @@ contract StakingContract is ReentrancyGuard {
         newRound.threshold = threshold;
         newRound.multiplier = multiplier;
         newRound.expiryBlockNumber = expiryBlock;
+        newRound.maxStakePerPlayer = maxStakePerPlayer; // Set the per-player cap
 
         emit RoundInitialized(currentRoundId, maxPlayerCount, threshold, multiplier, expiryBlock);
     }
 
-    function adjustRoundThreshold(
-        uint256 roundId,
-        int256 thresholdDeltaPercent
-    ) external onlyHostAgent {
-        Round storage round = rounds[roundId];
-        require(!round.isResolved, "Round already resolved");
-        require(block.number < round.expiryBlockNumber, "Round expired");
-
-        uint256 newThreshold;
-        if (thresholdDeltaPercent >= 0) {
-            newThreshold = round.threshold + ((round.threshold * uint256(thresholdDeltaPercent)) / 100);
-        } else {
-            uint256 absDelta = uint256(-thresholdDeltaPercent);
-            uint256 decrease = (round.threshold * absDelta) / 100;
-            newThreshold = (round.threshold > decrease) ? round.threshold - decrease : round.threshold;
-        }
-        require(newThreshold > 0, "Invalid threshold");
-
-        round.threshold = newThreshold;
-        emit RoundThresholdAdjusted(roundId, newThreshold);
-    }
-
-    function adjustRoundMultiplier(
-        uint256 roundId,
-        int256 multiplierDeltaPercent
-    ) external onlyHostAgent {
-        Round storage round = rounds[roundId];
-        require(!round.isResolved, "Round already resolved");
-        require(block.number < round.expiryBlockNumber, "Round expired");
-
-        uint256 newMultiplier;
-        if (multiplierDeltaPercent >= 0) {
-            newMultiplier = round.multiplier + ((round.multiplier * uint256(multiplierDeltaPercent)) / 100);
-        } else {
-            uint256 absDelta = uint256(-multiplierDeltaPercent);
-            uint256 decrease = (round.multiplier * absDelta) / 100;
-            newMultiplier = (round.multiplier > decrease) ? round.multiplier - decrease : round.multiplier;
-        }
-        require(newMultiplier >= 100, "Multiplier must be at least 100");
-
-        round.multiplier = newMultiplier;
-        emit RoundMultiplierAdjusted(roundId, newMultiplier);
-    }
-
+    // Updated enterRound to enforce per-player stake cap
     function enterRound(uint256 roundId, address player, uint256 amount) external nonReentrant onlyHostOrPlayer(player) {
         Round storage round = rounds[roundId];
         require(!round.isResolved, "Round already resolved");
         require(block.number < round.expiryBlockNumber, "Round expired");
         require(round.players.length < round.maxPlayerCount, "Round full");
         require(players[player].availableStakes >= amount + entryFee, "Insufficient available stakes");
+
+        // Ensure that the player's total stake in the round does not exceed the per-player cap.
+        uint256 newTotalStakeForPlayer = round.playerStakes[player] + amount;
+        require(newTotalStakeForPlayer <= round.maxStakePerPlayer, "Exceeds per-player stake cap");
 
         players[player].availableStakes -= (amount + entryFee);
         players[player].unavailableStakes += amount;
@@ -206,27 +174,29 @@ contract StakingContract is ReentrancyGuard {
         uint256[] memory distributions = new uint256[](roundPlayers.length);
 
         if (round.totalStaked >= round.threshold) {
+            // Winning round: redistribute the total reward equally among all participants.
             uint256 totalReward = round.totalStaked * round.multiplier / 100;
             uint256 surplusReward = totalReward - round.totalStaked;
             require(treasuryBalance >= surplusReward, "Insufficient treasury balance for rewards");
 
             treasuryBalance -= surplusReward;
+            uint256 numPlayers = round.players.length;
+            uint256 equalReward = totalReward / numPlayers;
 
-            for (uint256 i = 0; i < roundPlayers.length; i++) {
-                address player = roundPlayers[i];
-                uint256 playerStake = round.playerStakes[player];
-                uint256 reward = (playerStake * totalReward) / round.totalStaked;
-
-                distributions[i] = reward;
-                players[player].unavailableStakes -= playerStake;
-                players[player].availableStakes += reward;
+            for (uint256 i = 0; i < numPlayers; i++) {
+                address player = round.players[i];
+                distributions[i] = equalReward;
+                players[player].unavailableStakes -= round.playerStakes[player];
+                players[player].availableStakes += equalReward;
+                require(gameToken.transfer(player, equalReward), "Reward transfer failed");
             }
 
-            emit RoundResolved(roundId, "THRESHOLD_MET", roundPlayers, distributions);
+            emit RoundResolved(roundId, "THRESHOLD_MET", round.players, distributions);
             emit TreasuryBalanceChange(treasuryBalance);
         } else {
-            for (uint256 i = 0; i < roundPlayers.length; i++) {
-                address player = roundPlayers[i];
+            // Losing round: for each player, burn 50% of their stake and send the remaining 50% to treasury.
+            for (uint256 i = 0; i < round.players.length; i++) {
+                address player = round.players[i];
                 uint256 playerStake = round.playerStakes[player];
                 distributions[i] = 0;
                 players[player].unavailableStakes -= playerStake;
@@ -240,7 +210,7 @@ contract StakingContract is ReentrancyGuard {
                 treasuryBalance += amountToTreasury;
             }
 
-            emit RoundResolved(roundId, "THRESHOLD_NOT_MET", roundPlayers, distributions);
+            emit RoundResolved(roundId, "THRESHOLD_NOT_MET", round.players, distributions);
             emit TreasuryBalanceChange(treasuryBalance);
         }
     }
