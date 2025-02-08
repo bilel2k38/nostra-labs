@@ -1,0 +1,131 @@
+const { expect, anyValue } = require("chai");
+const { ethers, time, loadFixture } = require("@nomicfoundation/hardhat-network-helpers");
+
+describe("StakingContract - resolveRound", function () {
+  let Token, token, StakingContract, stakingContract;
+  let owner, hostAgent, treasuryManager, player1, player2;
+  const entryFee = 5; // 5 tokens as entry fee
+  const burnPercentage = 50; // 50% of stake burned on losing rounds
+  const multiplier = 200; // Example multiplier
+  const maxPlayerCount = 2;
+  const maxStakePerPlayer = 10; // Cap per player in a round
+  let currentBlock;
+
+  beforeEach(async function () {
+    [owner, hostAgent, treasuryManager, player1, player2] = await ethers.getSigners();
+
+    // Deploy a mock ERC20 token (use OpenZeppelin's ERC20Mock if available)
+    const ERC20Mock = await ethers.getContractFactory("ERC20Mock");
+    token = await ERC20Mock.deploy("MockToken", "MTK", owner.address, ethers.utils.parseUnits("1000000", 18));
+    await token.deployed();
+
+    // Distribute tokens to players
+    await token.transfer(player1.address, ethers.utils.parseUnits("1000", 18));
+    await token.transfer(player2.address, ethers.utils.parseUnits("1000", 18));
+
+    // Deploy the StakingContract
+    StakingContract = await ethers.getContractFactory("StakingContract");
+    stakingContract = await StakingContract.deploy(
+      token.address,
+      hostAgent.address,
+      treasuryManager.address,
+      entryFee,
+      burnPercentage
+    );
+    await stakingContract.deployed();
+
+    // Approve tokens for staking for both players
+    await token.connect(player1).approve(stakingContract.address, ethers.utils.parseUnits("1000", 18));
+    await token.connect(player2).approve(stakingContract.address, ethers.utils.parseUnits("1000", 18));
+  });
+
+  describe("Winning Round", function () {
+    it("Should redistribute rewards equally among players when threshold is met", async function () {
+      // Initialize round with threshold = 10, multiplier = 200, expiryBlock = current + 10, maxStakePerPlayer = 10
+      currentBlock = await ethers.provider.getBlockNumber();
+      const expiryBlock = currentBlock + 10;
+      await stakingContract.connect(hostAgent).initializeRound(maxPlayerCount, 10, multiplier, expiryBlock, maxStakePerPlayer);
+
+      // Players enter the round: player1 stakes 7, player2 stakes 3. Total = 10, which meets threshold.
+      await stakingContract.connect(hostAgent).enterRound(1, player1.address, 7);
+      await stakingContract.connect(hostAgent).enterRound(1, player2.address, 3);
+
+      // Treasury should have entry fees: 2 players * 5 = 10 tokens.
+      const treasuryBefore = await stakingContract.treasuryBalance();
+      expect(treasuryBefore).to.equal(10);
+
+      // Fast-forward to after expiryBlock
+      await time.advanceBlockTo(expiryBlock);
+
+      // Resolve the round (winning round)
+      await expect(stakingContract.resolveRound(1))
+        .to.emit(stakingContract, "RoundResolved")
+        .withArgs(1, "THRESHOLD_MET", anyValue, anyValue);
+
+      // In a winning round, each player should get the same reward.
+      // For a winning round: totalReward = totalStaked * multiplier / 100 = 10 * 200 / 100 = 20.
+      // SurplusReward = 20 - 10 = 10, which is deducted from treasury.
+      // Equal reward per player = totalReward / number of players = 20 / 2 = 10.
+      // Their locked stake is removed and replaced with the reward.
+      const player1Info = await stakingContract.players(player1.address);
+      const player2Info = await stakingContract.players(player2.address);
+      expect(player1Info.availableStakes).to.equal(10);
+      expect(player2Info.availableStakes).to.equal(10);
+    });
+  });
+
+  describe("Losing Round", function () {
+    it("Should burn 50% of stake and send 50% to treasury when threshold is not met", async function () {
+      // Initialize round with threshold = 15, multiplier = 200, expiryBlock = current + 10, maxStakePerPlayer = 10
+      currentBlock = await ethers.provider.getBlockNumber();
+      const expiryBlock = currentBlock + 10;
+      await stakingContract.connect(hostAgent).initializeRound(maxPlayerCount, 15, multiplier, expiryBlock, maxStakePerPlayer);
+
+      // Players enter the round: player1 stakes 7, player2 stakes 3. Total = 10, which is below threshold 15.
+      await stakingContract.connect(hostAgent).enterRound(1, player1.address, 7);
+      await stakingContract.connect(hostAgent).enterRound(1, player2.address, 3);
+
+      // Treasury gets entry fees: total = 10.
+      const treasuryBefore = await stakingContract.treasuryBalance();
+      expect(treasuryBefore).to.equal(10);
+
+      // Fast-forward to after expiryBlock.
+      await time.advanceBlockTo(expiryBlock);
+
+      // Resolve the round (losing round)
+      await expect(stakingContract.resolveRound(1))
+        .to.emit(stakingContract, "RoundResolved")
+        .withArgs(1, "THRESHOLD_NOT_MET", anyValue, anyValue);
+
+      // For each player: if stake is 7 and 3, then 50% is burned, and 50% goes to treasury.
+      // Assuming integer math: player1: floor(7 * 50/100) = 3 burned, remainder = 4; player2: floor(3 * 50/100) = 1 burned, remainder = 2.
+      // Treasury increases by 4 + 2 = 6, new treasuryBalance = 10 (initial entry fees) + 6 = 16.
+      const treasuryAfter = await stakingContract.treasuryBalance();
+      expect(treasuryAfter).to.equal(16);
+
+      // Also, players' unavailable stakes should be reduced to zero.
+      const player1Info = await stakingContract.players(player1.address);
+      const player2Info = await stakingContract.players(player2.address);
+      expect(player1Info.availableStakes).to.equal(0);
+      expect(player2Info.availableStakes).to.equal(0);
+    });
+  });
+
+  describe("Reverts", function () {
+    it("Should revert if round already resolved", async function () {
+      currentBlock = await ethers.provider.getBlockNumber();
+      const expiryBlock = currentBlock + 5;
+      await stakingContract.connect(hostAgent).initializeRound(maxPlayerCount, 10, multiplier, expiryBlock, maxStakePerPlayer);
+      await time.advanceBlockTo(expiryBlock);
+      await stakingContract.resolveRound(1);
+      await expect(stakingContract.resolveRound(1)).to.be.revertedWith("Round already resolved");
+    });
+
+    it("Should revert if round not expired", async function () {
+      currentBlock = await ethers.provider.getBlockNumber();
+      const expiryBlock = currentBlock + 100; // Future block
+      await stakingContract.connect(hostAgent).initializeRound(maxPlayerCount, 10, multiplier, expiryBlock, maxStakePerPlayer);
+      await expect(stakingContract.resolveRound(1)).to.be.revertedWith("Round not expired");
+    });
+  });
+});
